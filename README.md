@@ -200,3 +200,4 @@ The following two documents were used as references for the MPQ format:
 ## Copyright
 
 Copyright 2010, 2011 Aku Kotkavuo. See LICENSE for details.
+Copyright 2012 heinrich5991. See LICENSE for details.

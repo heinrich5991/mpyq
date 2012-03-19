@@ -6,8 +6,8 @@ from mpyq import __version__ as version
 
 setup(name='mpyq',
       version=version,
-      author='Aku Kotkavuo',
-      author_email='aku@hibana.net',
+      author='Aku Kotkavuo and heinrich5991',
+      author_email='aku@hibana.net heinrich5991@gmail.com',
       url='http://github.com/arkx/mpyq/',
       description='A Python library for extracting MPQ (MoPaQ) files.',
       py_modules=['mpyq'],

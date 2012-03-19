@@ -6,14 +6,15 @@ mpyq is a Python library for reading MPQ (MoPaQ) archives.
 """
 
 import bz2
-import cStringIO
+from cStringIO import StringIO
+import math
 import os
 import struct
 import zlib
 from collections import namedtuple
 
 
-__author__ = "Aku Kotkavuo"
+__author__ = "Aku Kotkavuo and heinrich5991"
 __version__ = "0.2.0"
 
 
@@ -81,16 +82,311 @@ MPQBlockTableEntry = namedtuple('MPQBlockTableEntry',
 )
 MPQBlockTableEntry.struct_format = '4I'
 
+def pad(number, mod):
+    return number + (-number % mod)
 
-class MPQArchive(object):
+class MPQCommon:
+    @classmethod
+    def hash(cls, string, hash_type):
+        """Hash a string using MPQ's hash function."""
+        hash_types = {
+            'TABLE_OFFSET': 0,
+            'HASH_A': 1,
+            'HASH_B': 2,
+            'TABLE': 3
+        }
+        seed1 = 0x7FED7FED
+        seed2 = 0xEEEEEEEE
 
+        for ch in string:
+            ch = ord(ch.upper())
+            value = cls.encryption_table[(hash_types[hash_type] << 8) + ch]
+            seed1 = (value ^ (seed1 + seed2)) & 0xFFFFFFFF
+            seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3 & 0xFFFFFFFF
+
+        return seed1
+
+    @classmethod
+    def encrypt(cls, data, key):
+        """Encrypt hash or block table or a sector."""
+        seed1 = key
+        seed2 = 0xEEEEEEEE
+        result = StringIO()
+
+        for i in range(len(data) // 4):
+            seed2 += cls.encryption_table[0x400 + (seed1 & 0xFF)]
+
+            # this isn't required in c, because integers would just wrap
+            seed2 &= 0xFFFFFFFF
+
+            value = struct.unpack("<I", data[4*i:4*i+4])[0]
+            
+            result.write(struct.pack("<I", value ^ ((seed1 + seed2) & 0xFFFFFFFF)))
+
+            seed1 = (((~seed1 << 0x15) + 0x11111111) | (seed1 >> 0xB)) & 0xFFFFFFFF
+            seed2 = (value + seed2 + (seed2 << 5) + 3) & 0xFFFFFFFF
+
+        return result.getvalue()
+
+    @classmethod
+    def decrypt(cls, data, key):
+        """Decrypt hash or block table or a sector."""
+        seed1 = key
+        seed2 = 0xEEEEEEEE
+        result = StringIO()
+
+        for i in range(len(data) // 4):
+            seed2 += cls.encryption_table[0x400 + (seed1 & 0xFF)]
+            seed2 &= 0xFFFFFFFF
+            value = struct.unpack("<I", data[i*4:i*4+4])[0]
+            value = (value ^ (seed1 + seed2)) & 0xFFFFFFFF
+
+            seed1 = ((~seed1 << 0x15) + 0x11111111) | (seed1 >> 0x0B)
+            seed1 &= 0xFFFFFFFF
+            seed2 = value + seed2 + (seed2 << 5) + 3 & 0xFFFFFFFF
+
+            result.write(struct.pack("<I", value))
+
+        return result.getvalue()
+
+    @classmethod
+    def _prepare_encryption_table(cls):
+        """Prepare encryption table for MPQ hash function."""
+        seed = 0x00100001
+        crypt_table = {}
+
+        for i in range(256):
+            index = i
+            for j in range(5):
+                seed = (seed * 125 + 3) % 0x2AAAAB
+                temp1 = (seed & 0xFFFF) << 0x10
+
+                seed = (seed * 125 + 3) % 0x2AAAAB
+                temp2 = (seed & 0xFFFF)
+
+                crypt_table[index] = (temp1 | temp2)
+
+                index += 0x100
+
+        cls.encryption_table = crypt_table
+
+class MPQArchiveWriter:
+    def __init__(self, filename, archive_reader=None):
+        if hasattr(filename, 'write'):
+            self.file = filename
+            self.close_file = False
+        else:
+            self.file = open(filename, 'wb')
+            self.close_file = True
+
+        self.user_data = None
+        self.sector_size_shift = 3
+
+        if archive_reader:
+            if 'user_data_header' in archive_reader.header:
+                self.user_data = archive_reader.header['user_data_header']['content']
+            self.sector_size_shift = archive_reader.header['sector_size_shift']
+
+        self.offsets = {}
+        self.offsets['start'] = self.file.tell()
+
+        self.hash_table = []
+        self.block_table = []
+        self.listfile = []
+
+        self.initialised = False
+
+    def _check_initialisation(self):
+        if self.initialised:
+            return
+
+        self.file.seek(self.offsets['start'])
+        if self.user_data:
+            self.offsets['userdata'] = pad(self.file.tell(), 512)
+            self.file.seek(self.offsets['userdata'])
+            self.file.write(struct.calcsize(MPQUserDataHeader.struct_format) * '\x00')
+            self.file.write(self.user_data)
+
+        self.offsets['header'] = pad(self.file.tell(), 512)
+        self.file.seek(self.offsets['header'])
+        self.file.write(struct.calcsize(MPQFileHeader.struct_format) * '\x00')
+        self.offsets['data'] = self.file.tell()
+        self.offsets['nextdata'] = self.offsets['data']
+
+        if self.user_data:
+            self.file.seek(self.offsets['userdata'])
+            user_data_header = MPQUserDataHeader(
+                magic='MPQ\x1b',
+                user_data_size=self.offsets['header']-self.offsets['userdata'],
+                mpq_header_offset=self.offsets['header']-self.offsets['userdata'],
+                user_data_header_size=len(self.user_data)
+            )
+            self.file.write(struct.pack(MPQUserDataHeader.struct_format,
+                                        *user_data_header))
+
+        self.initialised = True
+
+    def _write_file(self, file):
+        self._check_initialisation()
+        begin_file = self.offsets['nextdata']
+
+        sector_size = 512 << self.sector_size_shift
+
+        if file:
+            file.seek(0, 2) # go to the end
+            file_size = file.tell()
+            file.seek(0)
+        else:
+            file_size = 0
+
+        flags = 0
+        archived_size = 0
+
+        num_sectors = pad(file_size, sector_size) // sector_size
+
+        if num_sectors >= 1:
+            flags |= MPQ_FILE_EXISTS
+
+        if num_sectors > 1:
+            sector_offsets = [0 for x in range(num_sectors + 1)]
+
+            self.file.seek(begin_file)
+            #self.file.write(struct.pack('<%dI' % len(sector_offsets), *sector_offsets))
+
+            #sector_offsets[0] = self.file.tell() - begin_file
+            for s in range(1, len(sector_offsets)):
+                data = file.read(sector_size)
+                self.file.write(data)
+
+                archived_size += len(data)
+                #sector_offsets[s] = self.file.tell() - begin_file
+
+            self.offsets['nextdata'] = self.file.tell()
+
+            self.file.seek(begin_file)
+            #self.file.write(struct.pack('<%dI' % len(sector_offsets), *sector_offsets))
+            #sector_table_size = struct.calcsize('<%dI' % len(sector_offsets))
+            #file_size += sector_table_size
+            #archived_size += sector_table_size
+        elif num_sectors == 1:
+            flags |= MPQ_FILE_SINGLE_UNIT
+
+            self.file.seek(begin_file)
+            data = file.read()
+            self.file.write(data)
+            archived_size = len(data)
+
+            self.offsets['nextdata'] = self.file.tell()
+        else:
+            flags |= MPQ_FILE_DELETE_MARKER
+
+        block_table_entry = MPQBlockTableEntry(
+            offset=begin_file,
+            size=file_size,
+            archived_size=archived_size,
+            flags=flags
+        )
+
+        return block_table_entry
+
+    def add_file_by_hash(self, filename, hash_a, hash_b, locale=0, platform=0):
+        if not filename:
+            block_table_entry = self._write_file(None)
+        elif hasattr(filename, 'read'):
+            block_table_entry = self._write_file(filename)
+        else:
+            with open(filename, 'rb') as file:
+                block_table_entry = self._write_file(file)
+
+        hash_table_entry = MPQHashTableEntry(
+            hash_a=hash_a,
+            hash_b=hash_b,
+            locale=locale,
+            platform=platform,
+            block_table_index=len(self.block_table)
+        )
+
+        self.hash_table.append(hash_table_entry)
+        self.block_table.append(block_table_entry)
+
+    def add_file(self, filename, filename_archive, locale=0, platform=0,
+                 update_listfile=True):
+
+        self.add_file_by_hash(filename,
+                              hash_a=MPQCommon.hash(filename_archive, 'HASH_A'),
+                              hash_b=MPQCommon.hash(filename_archive, 'HASH_B'),
+                              locale=locale, platform=platform)
+
+        if update_listfile:
+            self.listfile.append(filename_archive)
+
+    def close(self):
+        self._check_initialisation()
+
+        def _get_raw_table_data(table_type, table_entries):
+            if table_type == 'hash':
+                entry_class = MPQHashTableEntry
+            elif table_type == 'block':
+                entry_class = MPQBlockTableEntry
+            else:
+                raise ValueError("Invalid table type.")
+
+            key = MPQCommon.hash('(%s table)' % table_type, 'TABLE')
+
+            table_entries = [struct.pack(entry_class.struct_format, *x)
+                             for x in table_entries]
+            data = ''.join(table_entries)
+            return MPQCommon.encrypt(data, key)
+
+        self.add_file(StringIO('\n'.join(self.listfile) + '\n'),
+                      '(listfile)', update_listfile=False)
+
+        self.file.seek(self.offsets['nextdata'])
+        del self.offsets['nextdata']
+
+        wanted_hash_table_size = 2 ** (int(math.log(len(self.hash_table) - 1, 2)) + 1)
+        for i in range(wanted_hash_table_size - len(self.hash_table)):
+            self.hash_table.append(MPQHashTableEntry(
+                hash_a=0,
+                hash_b=0,
+                language=0,
+                platform=0,
+                block_table_index=0xFFFFFFFF
+            ))
+
+        self.offsets['hash_table'] = self.file.tell()
+        self.file.write(_get_raw_table_data('hash', self.hash_table))
+        self.offsets['block_table'] = self.file.tell()
+        self.file.write(_get_raw_table_data('block', self.block_table))
+        self.offsets['end'] = self.file.tell()
+
+        self.file.seek(self.offsets['header'])
+        header = MPQFileHeader(
+            magic='MPQ\x1a',
+            header_size=struct.calcsize(MPQFileHeader.struct_format),
+            archive_size=self.offsets['end']-self.offsets['header'],
+            format_version=0,
+            sector_size_shift=self.sector_size_shift,
+            hash_table_offset=self.offsets['hash_table']-self.offsets['header'],
+            hash_table_entries=len(self.hash_table),
+            block_table_offset=self.offsets['block_table']-self.offsets['header'],
+            block_table_entries=len(self.block_table)
+        )
+        self.file.write(struct.pack(MPQFileHeader.struct_format, *header))
+
+        if self.close_file:
+            self.file.close()
+        self.file = None
+
+class MPQArchiveReader:
     def __init__(self, filename, listfile=True):
-        """Create a MPQArchive object.
+        """Open an MPQ archive.
 
         You can skip reading the listfile if you pass listfile=False
         to the constructor. The 'files' attribute will be unavailable
         if you do this.
         """
+
         if hasattr(filename, 'read'):
             self.file = filename
         else:
@@ -154,11 +450,11 @@ class MPQArchive(object):
 
         table_offset = self.header['%s_table_offset' % table_type]
         table_entries = self.header['%s_table_entries' % table_type]
-        key = self._hash('(%s table)' % table_type, 'TABLE')
+        key = MPQCommon.hash('(%s table)' % table_type, 'TABLE')
 
         self.file.seek(table_offset + self.header['offset'])
         data = self.file.read(table_entries * 16)
-        data = self._decrypt(data, key)
+        data = MPQCommon.decrypt(data, key)
 
         def unpack_entry(position):
             entry_data = data[position*16:position*16+16]
@@ -169,10 +465,10 @@ class MPQArchive(object):
 
     def get_hash_table_entry(self, filename):
         """Get the hash table entry corresponding to a given filename."""
-        hash_a = self._hash(filename, 'HASH_A')
-        hash_b = self._hash(filename, 'HASH_B')
+        hash_a = MPQCommon.hash(filename, 'HASH_A')
+        hash_b = MPQCommon.hash(filename, 'HASH_B')
         for entry in self.hash_table:
-            if (entry.hash_a == hash_a and entry.hash_b == hash_b):
+            if entry.hash_a == hash_a and entry.hash_b == hash_b:
                 return entry
 
     def read_file(self, filename, force_decompress=False):
@@ -211,7 +507,7 @@ class MPQArchive(object):
                 # File consist of many sectors. They all need to be
                 # decompressed separately and united.
                 sector_size = 512 << self.header['sector_size_shift']
-                sectors = block_entry.size / sector_size + 1
+                sectors = block_entry.size // sector_size + 1
                 if block_entry.flags & MPQ_FILE_SECTOR_CRC:
                     crc = True
                     sectors += 1
@@ -219,7 +515,7 @@ class MPQArchive(object):
                     crc = False
                 positions = struct.unpack('<%dI' % (sectors + 1),
                                           file_data[:4*(sectors+1)])
-                result = cStringIO.StringIO()
+                result = StringIO()
                 for i in range(len(positions) - (2 if crc else 1)):
                     sector = file_data[positions[i]:positions[i+1]]
                     if (block_entry.flags & MPQ_FILE_COMPRESS and
@@ -305,68 +601,6 @@ class MPQArchive(object):
                                                         block_entry.size,
                                                         width=width)
 
-    def _hash(self, string, hash_type):
-        """Hash a string using MPQ's hash function."""
-        hash_types = {
-            'TABLE_OFFSET': 0,
-            'HASH_A': 1,
-            'HASH_B': 2,
-            'TABLE': 3
-        }
-        seed1 = 0x7FED7FED
-        seed2 = 0xEEEEEEEE
-
-        for ch in string:
-            ch = ord(ch.upper())
-            value = self.encryption_table[(hash_types[hash_type] << 8) + ch]
-            seed1 = (value ^ (seed1 + seed2)) & 0xFFFFFFFF
-            seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3 & 0xFFFFFFFF
-
-        return seed1
-
-    def _decrypt(self, data, key):
-        """Decrypt hash or block table or a sector."""
-        seed1 = key
-        seed2 = 0xEEEEEEEE
-        result = cStringIO.StringIO()
-
-        for i in range(len(data) // 4):
-            seed2 += self.encryption_table[0x400 + (seed1 & 0xFF)]
-            seed2 &= 0xFFFFFFFF
-            value = struct.unpack("<I", data[i*4:i*4+4])[0]
-            value = (value ^ (seed1 + seed2)) & 0xFFFFFFFF
-
-            seed1 = ((~seed1 << 0x15) + 0x11111111) | (seed1 >> 0x0B)
-            seed1 &= 0xFFFFFFFF
-            seed2 = value + seed2 + (seed2 << 5) + 3 & 0xFFFFFFFF
-
-            result.write(struct.pack("<I", value))
-
-        return result.getvalue()
-
-    def _prepare_encryption_table():
-        """Prepare encryption table for MPQ hash function."""
-        seed = 0x00100001
-        crypt_table = {}
-
-        for i in range(256):
-            index = i
-            for j in range(5):
-                seed = (seed * 125 + 3) % 0x2AAAAB
-                temp1 = (seed & 0xFFFF) << 0x10
-
-                seed = (seed * 125 + 3) % 0x2AAAAB
-                temp2 = (seed & 0xFFFF)
-
-                crypt_table[index] = (temp1 | temp2)
-
-                index += 0x100
-
-        return crypt_table
-
-    encryption_table = _prepare_encryption_table()
-
-
 def main():
     import argparse
     description = "mpyq reads and extracts MPQ archives."
@@ -387,9 +621,9 @@ def main():
     args = parser.parse_args()
     if args.file:
         if not args.skip_listfile:
-            archive = MPQArchive(args.file)
+            archive = MPQArchiveReader(args.file)
         else:
-            archive = MPQArchive(args.file, listfile=False)
+            archive = MPQArchiveReader(args.file, listfile=False)
         if args.headers:
             archive.print_headers()
         if args.hash_table:
@@ -401,6 +635,7 @@ def main():
         if args.extract:
             archive.extract_to_disk()
 
+MPQCommon._prepare_encryption_table()
 
 if __name__ == '__main__':
     main()
