@@ -504,25 +504,29 @@ class MPQArchiveReader:
                 raise NotImplementedError("Encryption is not supported yet.")
 
             if not block_entry.flags & MPQ_FILE_SINGLE_UNIT:
-                # File consist of many sectors. They all need to be
-                # decompressed separately and united.
-                sector_size = 512 << self.header['sector_size_shift']
-                sectors = block_entry.size // sector_size + 1
-                if block_entry.flags & MPQ_FILE_SECTOR_CRC:
-                    crc = True
-                    sectors += 1
+                if block_entry.flags & MPQ_FILE_COMPRESS:
+                    # File consist of many sectors. They all need to be
+                    # decompressed separately and united.
+                    sector_size = 512 << self.header['sector_size_shift']
+                    sectors = block_entry.size // sector_size + 1
+                    if block_entry.flags & MPQ_FILE_SECTOR_CRC:
+                        crc = True
+                        sectors += 1
+                    else:
+                        crc = False
+                    positions = struct.unpack('<%dI' % (sectors + 1),
+                                              file_data[:4*(sectors+1)])
+                    result = StringIO()
+                    for i in range(len(positions) - (2 if crc else 1)):
+                        sector = file_data[positions[i]:positions[i+1]]
+                        if (block_entry.flags & MPQ_FILE_COMPRESS and
+                            (force_decompress or block_entry.size > block_entry.archived_size)):
+                            sector = decompress(sector)
+                        result.write(sector)
+                    file_data = result.getvalue()
                 else:
-                    crc = False
-                positions = struct.unpack('<%dI' % (sectors + 1),
-                                          file_data[:4*(sectors+1)])
-                result = StringIO()
-                for i in range(len(positions) - (2 if crc else 1)):
-                    sector = file_data[positions[i]:positions[i+1]]
-                    if (block_entry.flags & MPQ_FILE_COMPRESS and
-                        (force_decompress or block_entry.size > block_entry.archived_size)):
-                        sector = decompress(sector)
-                    result.write(sector)
-                file_data = result.getvalue()
+                    # Uncompressed files do not have the sector offset table
+                    file_data = file_data
             else:
                 # Single unit files only need to be decompressed, but
                 # compression only happens when at least one byte is gained.
