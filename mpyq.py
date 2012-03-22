@@ -165,7 +165,18 @@ class MPQCommon:
     @staticmethod
     def compress(data):
         """Try compressions and return the best one."""
-        return data
+        compressed = []
+        compressed.append(chr(16) + bz2.compress(data))
+        compressed.append(chr(2) + zlib.compress(data))
+        compressed_data = data
+        for d in compressed:
+            if len(d) < len(compressed_data):
+                compressed_data = d
+
+        # correctly compressed?
+        assert data == compressed_data or MPQCommon.decompress(compressed_data) == data
+
+        return compressed_data
 
     @classmethod
     def _prepare_encryption_table(cls):
@@ -277,10 +288,9 @@ class MPQArchiveWriter:
             sector_offsets[0] = self.file.tell() - begin_file
             for s in range(1, len(sector_offsets)):
                 data = file.read(sector_size)
-                self.file.write(data)
-
                 if compress:
                     data = MPQCommon.compress(data)
+                self.file.write(data)
 
                 archived_size += len(data)
                 sector_offsets[s] = self.file.tell() - begin_file
@@ -291,15 +301,16 @@ class MPQArchiveWriter:
                 self.file.seek(begin_file)
                 self.file.write(struct.pack('<%dI' % len(sector_offsets), *sector_offsets))
                 sector_table_size = struct.calcsize('<%dI' % len(sector_offsets))
-                file_size += sector_table_size
-                archived_size += sector_table_size
+
         elif num_sectors >= 0:
             flags |= MPQ_FILE_SINGLE_UNIT
 
             self.file.seek(begin_file)
             data = file.read()
             if compress:
-                data = MPQCommon.compress(data)
+                compressed_data = MPQCommon.compress(data)
+                if len(compressed_data) < len(data):
+                    data = compressed_data
             self.file.write(data)
             archived_size = len(data)
 
