@@ -149,6 +149,24 @@ class MPQCommon:
 
         return result.getvalue()
 
+    @staticmethod
+    def decompress(data):
+        """Read the compression type and decompress file data."""
+        compression_type = ord(data[0])
+        if compression_type == 0:
+            return data
+        elif compression_type == 2:
+            return zlib.decompress(data[1:], 15)
+        elif compression_type == 16:
+            return bz2.decompress(data[1:])
+        else:
+            raise RuntimeError("Unsupported compression type.")
+
+    @staticmethod
+    def compress(data):
+        """Try compressions and return the best one."""
+        return data
+
     @classmethod
     def _prepare_encryption_table(cls):
         """Prepare encryption table for MPQ hash function."""
@@ -226,7 +244,7 @@ class MPQArchiveWriter:
 
         self.initialised = True
 
-    def _write_file(self, file):
+    def _write_file(self, file, compress=True):
         self._check_initialisation()
         begin_file = self.offsets['nextdata']
 
@@ -237,42 +255,51 @@ class MPQArchiveWriter:
             file_size = file.tell()
             file.seek(0)
         else:
-            file_size = 0
+            file_size = -512
 
         flags = 0
         archived_size = 0
 
         num_sectors = pad(file_size, sector_size) // sector_size
 
-        if num_sectors >= 1:
+        if num_sectors >= 0:
             flags |= MPQ_FILE_EXISTS
+            if compress:
+                flags |= MPQ_FILE_COMPRESS
 
         if num_sectors > 1:
             sector_offsets = [0 for x in range(num_sectors + 1)]
 
             self.file.seek(begin_file)
-            #self.file.write(struct.pack('<%dI' % len(sector_offsets), *sector_offsets))
+            if compress:
+                self.file.write(struct.pack('<%dI' % len(sector_offsets), *sector_offsets))
 
-            #sector_offsets[0] = self.file.tell() - begin_file
+            sector_offsets[0] = self.file.tell() - begin_file
             for s in range(1, len(sector_offsets)):
                 data = file.read(sector_size)
                 self.file.write(data)
 
+                if compress:
+                    data = MPQCommon.compress(data)
+
                 archived_size += len(data)
-                #sector_offsets[s] = self.file.tell() - begin_file
+                sector_offsets[s] = self.file.tell() - begin_file
 
             self.offsets['nextdata'] = self.file.tell()
 
-            self.file.seek(begin_file)
-            #self.file.write(struct.pack('<%dI' % len(sector_offsets), *sector_offsets))
-            #sector_table_size = struct.calcsize('<%dI' % len(sector_offsets))
-            #file_size += sector_table_size
-            #archived_size += sector_table_size
-        elif num_sectors == 1:
+            if compress:
+                self.file.seek(begin_file)
+                self.file.write(struct.pack('<%dI' % len(sector_offsets), *sector_offsets))
+                sector_table_size = struct.calcsize('<%dI' % len(sector_offsets))
+                file_size += sector_table_size
+                archived_size += sector_table_size
+        elif num_sectors >= 0:
             flags |= MPQ_FILE_SINGLE_UNIT
 
             self.file.seek(begin_file)
             data = file.read()
+            if compress:
+                data = MPQCommon.compress(data)
             self.file.write(data)
             archived_size = len(data)
 
@@ -289,14 +316,18 @@ class MPQArchiveWriter:
 
         return block_table_entry
 
-    def add_file_by_hash(self, filename, hash_a, hash_b, locale=0, platform=0):
-        if not filename:
-            block_table_entry = self._write_file(None)
-        elif hasattr(filename, 'read'):
-            block_table_entry = self._write_file(filename)
+    def add_file_by_hash(self, filename, hash_a, hash_b, locale=0, platform=0, **kwargs):
+        close = False
+        if filename is None or hasattr(filename, 'read'):
+            file = filename
         else:
-            with open(filename, 'rb') as file:
-                block_table_entry = self._write_file(file)
+            file = open(filename, 'rb')
+            close = True
+
+        block_table_entry = self._write_file(file, **kwargs)
+
+        if close:
+            file.close()
 
         hash_table_entry = MPQHashTableEntry(
             hash_a=hash_a,
@@ -309,13 +340,12 @@ class MPQArchiveWriter:
         self.hash_table.append(hash_table_entry)
         self.block_table.append(block_table_entry)
 
-    def add_file(self, filename, filename_archive, locale=0, platform=0,
-                 update_listfile=True):
-
+    def add_file(self, filename, filename_archive, update_listfile=True, **kwargs):
+        """Add a file to the archive by name."""
         self.add_file_by_hash(filename,
                               hash_a=MPQCommon.hash(filename_archive, 'HASH_A'),
                               hash_b=MPQCommon.hash(filename_archive, 'HASH_B'),
-                              locale=locale, platform=platform)
+                              **kwargs)
 
         if update_listfile:
             self.listfile.append(filename_archive)
@@ -473,19 +503,6 @@ class MPQArchiveReader:
 
     def read_file(self, filename, force_decompress=False):
         """Read a file from the MPQ archive."""
-
-        def decompress(data):
-            """Read the compression type and decompress file data."""
-            compression_type = ord(data[0])
-            if compression_type == 0:
-                return data
-            elif compression_type == 2:
-                return zlib.decompress(data[1:], 15)
-            elif compression_type == 16:
-                return bz2.decompress(data[1:])
-            else:
-                raise RuntimeError("Unsupported compression type.")
-
         hash_entry = self.get_hash_table_entry(filename)
         if hash_entry is None:
             return None
@@ -521,7 +538,7 @@ class MPQArchiveReader:
                         sector = file_data[positions[i]:positions[i+1]]
                         if (block_entry.flags & MPQ_FILE_COMPRESS and
                             (force_decompress or block_entry.size > block_entry.archived_size)):
-                            sector = decompress(sector)
+                            sector = MPQCommon.decompress(sector)
                         result.write(sector)
                     file_data = result.getvalue()
                 else:
@@ -532,7 +549,7 @@ class MPQArchiveReader:
                 # compression only happens when at least one byte is gained.
                 if (block_entry.flags & MPQ_FILE_COMPRESS and
                     (force_decompress or block_entry.size > block_entry.archived_size)):
-                    file_data = decompress(file_data)
+                    file_data = MPQCommon.decompress(file_data)
 
             return file_data
 
