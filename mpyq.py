@@ -536,19 +536,20 @@ class MPQArchiveReader:
                     # File consist of many sectors. They all need to be
                     # decompressed separately and united.
                     sector_size = 512 << self.header['sector_size_shift']
-                    sectors = block_entry.size // sector_size + 1
+                    num_sectors = block_entry.size // sector_size + 1
+                    num_data_sectors = num_sectors
                     if block_entry.flags & MPQ_FILE_SECTOR_CRC:
                         crc = True
-                        sectors += 1
+                        num_sectors += 1
                     else:
                         crc = False
-                    positions = struct.unpack('<%dI' % (sectors + 1),
-                                              file_data[:4*(sectors+1)])
+                    positions = struct.unpack('<%dI' % (num_sectors + 1),
+                                              file_data[:4*(num_sectors+1)])
                     result = StringIO()
-                    for i in range(len(positions) - (2 if crc else 1)):
+                    for i in range(num_data_sectors - 1):
                         sector = file_data[positions[i]:positions[i+1]]
-                        if (block_entry.flags & MPQ_FILE_COMPRESS and
-                            (force_decompress or block_entry.size > block_entry.archived_size)):
+                        if (force_decompress or
+                            len(sector) < (sector_size if i < num_data_sectors - 2 else block_entry.size % sector_size)):
                             sector = MPQCommon.decompress(sector)
                         result.write(sector)
                     file_data = result.getvalue()
