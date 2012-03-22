@@ -179,6 +179,82 @@ class MPQCommon:
         return compressed_data
 
     @classmethod
+    def get_file_extension(cls, content):
+        if content:
+            for magic_checker in cls.magic_checkers:
+                extension = magic_checker(content)
+                if extension:
+                    return '.' + extension
+        return ''
+
+    @classmethod
+    def add_filename(cls, filename):
+        filename = filename.lower()
+        hash_a = cls.hash(filename, 'HASH_A')
+        hash_b = cls.hash(filename, 'HASH_B')
+        cls.lookup_table[(hash_a, hash_b)] = filename
+
+    @classmethod
+    def get_filename(cls, hash_a, hash_b, content=None):
+        if (hash_a, hash_b) not in cls.lookup_table:
+            return "(%x%x)" % (hash_a, hash_b) + cls.get_file_extension(content)
+
+        return cls.lookup_table[(hash_a, hash_b)]
+
+    @classmethod
+    def _prepare_lookup_table(cls):
+        cls.lookup_table = {}
+
+        # taken from stormlib
+        magic_table_stormlib = (
+            (0x00005A4D, 0x0000FFFF, 0x00000000, 0x00000000, "exe"),    # EXE files
+            (0x00000006, 0xFFFFFFFF, 0x00000001, 0xFFFFFFFF, "dc6"),    # EXE files
+            (0x1A51504D, 0xFFFFFFFF, 0x00000000, 0x00000000, "mpq"),    # MPQ archive header ID ('MPQ\x1A')
+            (0x46464952, 0xFFFFFFFF, 0x00000000, 0x00000000, "wav"),    # WAVE header 'RIFF'
+            (0x324B4D53, 0xFFFFFFFF, 0x00000000, 0x00000000, "smk"),    # Old "Smacker Video" files 'SMK2'
+            (0x694B4942, 0xFFFFFFFF, 0x00000000, 0x00000000, "bik"),    # Bink video files (new)
+            (0x0801050A, 0xFFFFFFFF, 0x00000000, 0x00000000, "pcx"),    # PCX images used in Diablo I
+            (0x544E4F46, 0xFFFFFFFF, 0x00000000, 0x00000000, "fnt"),    # Font files used in Diablo II
+            (0x6D74683C, 0xFFFFFFFF, 0x00000000, 0x00000000, "html"),   # HTML '<htm'
+            (0x4D54483C, 0xFFFFFFFF, 0x00000000, 0x00000000, "html"),   # HTML '<HTM
+            (0x216F6F57, 0xFFFFFFFF, 0x00000000, 0x00000000, "tbl"),    # Table files
+            (0x31504C42, 0xFFFFFFFF, 0x00000000, 0x00000000, "blp"),    # BLP textures
+            (0x32504C42, 0xFFFFFFFF, 0x00000000, 0x00000000, "blp"),    # BLP textures (v2)
+            (0x584C444D, 0xFFFFFFFF, 0x00000000, 0x00000000, "mdx"),    # MDX files
+            (0x45505954, 0xFFFFFFFF, 0x00000000, 0x00000000, "pud"),    # Warcraft II maps
+            (0x38464947, 0xFFFFFFFF, 0x00000000, 0x00000000, "gif"),    # GIF images 'GIF8'
+            (0x3032444D, 0xFFFFFFFF, 0x00000000, 0x00000000, "m2"),     # WoW ??? .m2
+            (0x43424457, 0xFFFFFFFF, 0x00000000, 0x00000000, "dbc"),    # ??? .dbc
+            (0x47585053, 0xFFFFFFFF, 0x00000000, 0x00000000, "bls"),    # WoW pixel shaders
+            (0xE0FFD8FF, 0xFFFFFFFF, 0x00000000, 0x00000000, "jpg"),    # JPEG image
+        )
+
+        def check_magic_stormlib(content):
+            dword00, dword04 = struct.unpack('%I%I', content[:4])
+            for magic_stormlib in cls.magic_table_stormlib:
+                if (dword00 & magic.offset00mask == magic.offset00data and
+                    dword04 & magic.offset04mask == magic.offset04data):
+                    return magic.extension
+            return None
+
+        MagicStormlib = namedtuple('Magic', '''
+            offset00data
+            offset00mask
+            offset04data
+            offset04mask
+            extension
+        ''')
+
+        cls.magic_checkers = []
+        cls.magic_table_stormlib = []
+
+        for magic_stormlib in magic_table_stormlib:
+            cls.magic_table_stormlib.append(MagicStormlib(*magic_stormlib))
+
+        cls.magic_checkers.append(check_magic_stormlib)
+
+
+    @classmethod
     def _prepare_encryption_table(cls):
         """Prepare encryption table for MPQ hash function."""
         seed = 0x00100001
@@ -358,6 +434,7 @@ class MPQArchiveWriter:
                               hash_b=MPQCommon.hash(filename_archive, 'HASH_B'),
                               **kwargs)
 
+        MPQCommon.add_filename(filename_archive)
         if update_listfile:
             self.listfile.append(filename_archive)
 
@@ -420,13 +497,8 @@ class MPQArchiveWriter:
         self.file = None
 
 class MPQArchiveReader:
-    def __init__(self, filename, listfile=True):
-        """Open an MPQ archive.
-
-        You can skip reading the listfile if you pass listfile=False
-        to the constructor. The 'files' attribute will be unavailable
-        if you do this.
-        """
+    def __init__(self, filename):
+        """Open an MPQ archive."""
 
         if hasattr(filename, 'read'):
             self.file = filename
@@ -435,10 +507,10 @@ class MPQArchiveReader:
         self.header = self.read_header()
         self.hash_table = self.read_table('hash')
         self.block_table = self.read_table('block')
+        listfile = self.read_file('(listfile)')
         if listfile:
-            self.files = self.read_file('(listfile)').splitlines()
-        else:
-            self.files = None
+            for name in self.read_file('(listfile)').split():
+                MPQCommon.add_filename(name.strip())
 
     def read_header(self):
         """Read the header of a MPQ archive."""
@@ -512,11 +584,15 @@ class MPQArchiveReader:
             if entry.hash_a == hash_a and entry.hash_b == hash_b:
                 return entry
 
-    def read_file(self, filename, force_decompress=False):
+    def read_file(self, filename, **kwargs):
         """Read a file from the MPQ archive."""
+        MPQCommon.add_filename(filename)
         hash_entry = self.get_hash_table_entry(filename)
         if hash_entry is None:
             return None
+        return self.read_file_by_hashentry(hash_entry, **kwargs)
+
+    def read_file_by_hashentry(self, hash_entry, force_decompress=False):
         block_entry = self.block_table[hash_entry.block_table_index]
 
         # Read the block.
@@ -567,10 +643,9 @@ class MPQArchiveReader:
 
     def extract(self):
         """Extract all the files inside the MPQ archive in memory."""
-        if self.files:
-            return dict((f, self.read_file(f)) for f in self.files)
-        else:
-            raise RuntimeError("Can't extract whole archive without listfile.")
+        return dict((MPQCommon.get_filename(h.hash_a, h.hash_b),
+                     self.read_file_by_hashentry(h))
+                    for h in self.hash_table)
 
     def extract_to_disk(self):
         """Extract all files and write them to disk."""
@@ -578,10 +653,9 @@ class MPQArchiveReader:
         if not os.path.isdir(os.path.join(os.getcwd(), archive_name)):
             os.mkdir(archive_name)
         os.chdir(archive_name)
-        for filename, data in self.extract().items():
-            f = open(filename, 'wb')
-            f.write(data)
-            f.close()
+        for h in self.hash_table:
+            with open(MPQCommon.get_filename(h.hash_a, h.hash_b), 'wb') as f:
+                f.write(self.read_file_by_hashentry(h))
 
     def extract_files(self, *filenames):
         """Extract given files from the archive to disk."""
@@ -669,6 +743,7 @@ def main():
             archive.extract_to_disk()
 
 MPQCommon._prepare_encryption_table()
+MPQCommon._prepare_lookup_table()
 
 if __name__ == '__main__':
     main()
